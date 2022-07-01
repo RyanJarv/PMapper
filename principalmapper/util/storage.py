@@ -14,10 +14,17 @@
 #
 #      You should have received a copy of the GNU Affero General Public License
 #      along with Principal Mapper.  If not, see <https://www.gnu.org/licenses/>.
-
+import functools
+import json
 import os
 import os.path
+import pickle
 import sys
+
+from functools import wraps
+from pathlib import Path
+
+import botocore.exceptions
 
 
 def get_storage_root():
@@ -58,3 +65,37 @@ def get_storage_root():
 def get_default_graph_path(account_or_org: str):
     """Returns a path to a given account or organization by the provided string."""
     return os.path.join(get_storage_root(), account_or_org)
+
+
+@functools.lru_cache
+def get_cache(path: Path):
+    try:
+        return pickle.loads(path.read_bytes())
+    except (IOError, ValueError):
+        return {}
+
+
+# Not thread safe and won't work across multiple accounts!
+def cached(account_or_org: str, f, *args, cache_key=None, **kwargs):
+    root = Path(get_default_graph_path(account_or_org))/'cache'
+    os.makedirs(root, exist_ok=True)
+    p = root/f.__name__
+
+    cache = get_cache(p)
+
+    if not cache_key:
+        cache_key = json.dumps({"args": [*args], **kwargs}, default=str)
+
+    cache_obj = cache.get(cache_key)
+    # TODO: only throw non-temporary exceptions
+    if isinstance(cache_obj, Exception):
+        raise cache_obj
+    elif cache_obj is None:
+        try:
+            resp = f(*args, **kwargs)
+            cache[cache_key] = resp
+        except Exception as e:
+            cache[cache_key] = e
+        finally:
+            p.write_bytes(pickle.dumps(cache))
+    return cache[cache_key]

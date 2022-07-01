@@ -32,10 +32,10 @@ class Node(object):
 
     * (1.1.0) Added permissions_boundary support, has_mfa support, tags support"""
 
-    def __init__(self, arn: str, id_value: str, attached_policies: Optional[List[Policy]],
-                 group_memberships: Optional[List[Group]], trust_policy: Optional[dict],
-                 instance_profile: Optional[List[str]], num_access_keys: int, active_password: bool, is_admin: bool,
-                 permissions_boundary: Optional[Union[str, Policy]], has_mfa: bool, tags: Optional[dict]):
+    def __init__(self, arn: str, id_value: str, attached_policies: 'Optional[List[Policy]]',
+                 group_memberships: 'Optional[List[Group]]', trust_policy: 'Optional[dict]',
+                 instance_profile: 'Optional[List[str]]', num_access_keys: int, active_password: bool, is_admin: bool,
+                 permissions_boundary: 'Optional[Union[str, Policy]]', has_mfa: bool, tags: 'Optional[dict]'):
         """Constructor. Expects an ARN and ID value. Validates parameters based on the type of Node (User/Role),
         and rejects contradictory arguments like an IAM User with a trust policy.
         """

@@ -15,9 +15,7 @@
 #      You should have received a copy of the GNU Affero General Public License
 #      along with Principal Mapper.  If not, see <https://www.gnu.org/licenses/>.
 
-import io
 import logging
-import os
 from typing import List, Optional
 
 from botocore.exceptions import ClientError
@@ -28,7 +26,6 @@ from principalmapper.querying import query_interface
 from principalmapper.querying.local_policy_simulation import resource_policy_authorization, ResourcePolicyEvalResult
 from principalmapper.util import arns, botocore_tools
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -37,7 +34,8 @@ class CloudFormationEdgeChecker(EdgeChecker):
 
     def return_edges(self, nodes: List[Node], region_allow_list: Optional[List[str]] = None,
                      region_deny_list: Optional[List[str]] = None, scps: Optional[List[List[dict]]] = None,
-                     client_args_map: Optional[dict] = None) -> List[Edge]:
+                     client_args_map: Optional[dict] = None,
+                     session: Optional['botocore.session.Session'] = None) -> List[Edge]:
         """Fulfills expected method return_edges."""
 
         logger.info('Pulling data on CloudFormation stacks.')
@@ -49,10 +47,12 @@ class CloudFormationEdgeChecker(EdgeChecker):
 
         # Grab existing stacks in each region
         cloudformation_clients = []
-        if self.session is not None:
-            cf_regions = botocore_tools.get_regions_to_search(self.session, 'cloudformation', region_allow_list, region_deny_list)
+        if session is not None:
+            cf_regions = botocore_tools.get_regions_to_search(session, 'cloudformation', region_allow_list,
+                                                              region_deny_list)
             for region in cf_regions:
-                cloudformation_clients.append(self.session.create_client('cloudformation', region_name=region, **cfargs))
+                cloudformation_clients.append(
+                    session.create_client('cloudformation', region_name=region, **cfargs))
 
         # grab existing cloudformation stacks
         stack_list = []
@@ -78,7 +78,8 @@ class CloudFormationEdgeChecker(EdgeChecker):
         return result
 
 
-def generate_edges_locally(nodes: List[Node], stack_list: List[dict], scps: Optional[List[List[dict]]] = None) -> List[Edge]:
+def generate_edges_locally(nodes: List[Node], stack_list: List[dict], scps: Optional[List[List[dict]]] = None) -> List[
+    Edge]:
     """Generates and returns Edge objects. Works on the assumption that the param `stack_list` is the
     collected outputs from calling `cloudformation:DescribeStacks`. Thus, it is possible to
     create a similar output and feed it to this method if you are operating offline (infra-as-code).

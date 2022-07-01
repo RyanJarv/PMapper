@@ -19,6 +19,8 @@ import io
 import json
 import logging
 import os
+import traceback
+from concurrent import futures
 
 import botocore.session
 import botocore.exceptions
@@ -29,6 +31,8 @@ from principalmapper.querying import query_interface
 from principalmapper.util import arns
 from principalmapper.util.botocore_tools import get_regions_to_search
 from typing import List, Optional, Tuple
+
+from principalmapper.util.storage import cached
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +76,7 @@ def create_graph(session: botocore.session.Session, service_list: list, region_a
     iamargs = client_args_map.get('iam', {})
     iamclient = session.create_client('iam', **iamargs)
 
-    results = get_nodes_groups_and_policies(iamclient)
+    results = get_nodes_groups_and_policies(caller_identity['Account'], iamclient)
     nodes_result = results['nodes']
     groups_result = results['groups']
     policies_result = results['policies']
@@ -93,34 +97,33 @@ def create_graph(session: botocore.session.Session, service_list: list, region_a
 
     # Pull S3, SNS, SQS, KMS, and Secrets Manager resource policies
     try:
-        policies_result.extend(get_s3_bucket_policies(session, client_args_map))
-        policies_result.extend(get_sns_topic_policies(session, region_allow_list, region_deny_list, client_args_map))
-        policies_result.extend(get_sqs_queue_policies(session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map))
-        policies_result.extend(get_kms_key_policies(session, region_allow_list, region_deny_list, client_args_map))
-        policies_result.extend(get_secrets_manager_policies(session, region_allow_list, region_deny_list, client_args_map))
+        jobs = []
+        with futures.ThreadPoolExecutor() as pool:
+            jobs.append(pool.submit(get_s3_bucket_policies, session, caller_identity['Account'], client_args_map))
+            jobs.append(pool.submit(get_sns_topic_policies, session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map))
+            jobs.append(pool.submit(get_sqs_queue_policies, session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map))
+            jobs.append(pool.submit(get_kms_key_policies, session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map))
+            jobs.append(pool.submit(get_secrets_manager_policies, session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map))
+
+        for job in futures.as_completed(jobs):
+            exc = job.exception()
+            if exc:
+                traceback.print_tb(exc.__traceback__)
+                continue
+            policies_result.extend(job.result())
     except:
         pass
 
     return Graph(nodes_result, edges_result, policies_result, groups_result, metadata)
 
 
-def get_nodes_groups_and_policies(iamclient) -> dict:
+def get_nodes_groups_and_policies(account, iamclient) -> dict:
     """Using an IAM.Client object, return a dictionary containing nodes, groups, and policies to be
     added to a Graph object. Admin status for the nodes are not updated.
 
     Writes high-level information on progress to the output stream.
     """
-    logger.info('Obtaining IAM Users/Roles/Groups/Policies in the account.')
-    result_paginator = iamclient.get_paginator('get_account_authorization_details')
-    user_results = []
-    group_results = []
-    role_results = []
-    policy_results = []
-    for page in result_paginator.paginate():
-        user_results += page['UserDetailList']
-        group_results += page['GroupDetailList']
-        role_results += page['RoleDetailList']
-        policy_results += page['Policies']
+    group_results, policy_results, role_results, user_results = cached(account, iam_resources, iamclient, cache_key='iam_resources')
 
     logger.info('Sorting users, roles, groups, policies, and their relationships.')
 
@@ -245,12 +248,12 @@ def get_nodes_groups_and_policies(iamclient) -> dict:
             user_name = arns.get_resource(node.arn)[5:]
             if '/' in user_name:
                 user_name = user_name.split('/')[-1]
-            access_keys_data = iamclient.list_access_keys(UserName=user_name)
+            access_keys_data = cached(account, iamclient.list_access_keys, UserName=user_name)
             node.access_keys = len(access_keys_data['AccessKeyMetadata'])
             # logger.debug('Access Key Count for {}: {}'.format(user_name, len(access_keys_data['AccessKeyMetadata'])))
             # Grab password data and update node
             try:
-                login_profile_data = iamclient.get_login_profile(UserName=user_name)
+                login_profile_data = cached(account, iamclient.get_login_profile, UserName=user_name)
                 if 'LoginProfile' in login_profile_data:
                     node.active_password = True
             except Exception as ex:
@@ -275,14 +278,29 @@ def get_nodes_groups_and_policies(iamclient) -> dict:
         node_resource_name = arns.get_resource(node.arn)
         if node_resource_name.startswith('user/'):
             user_name = node_resource_name.split('/')[-1]
-            mfa_devices_response = iamclient.list_mfa_devices(UserName=user_name)
+            mfa_devices_response = cached(account, iamclient.list_mfa_devices, UserName=user_name)
             if len(mfa_devices_response['MFADevices']) > 0:
                 node.has_mfa = True
 
     return result
 
 
-def get_s3_bucket_policies(session: botocore.session.Session, client_args_map: Optional[dict] = None) -> List[Policy]:
+def iam_resources(iamclient):
+    logger.info('Obtaining IAM Users/Roles/Groups/Policies in the account.')
+    result_paginator = iamclient.get_paginator('get_account_authorization_details')
+    user_results = []
+    group_results = []
+    role_results = []
+    policy_results = []
+    for page in result_paginator.paginate():
+        user_results += page['UserDetailList']
+        group_results += page['GroupDetailList']
+        role_results += page['RoleDetailList']
+        policy_results += page['Policies']
+    return group_results, policy_results, role_results, user_results
+
+
+def get_s3_bucket_policies(session: botocore.session.Session, account_id, client_args_map: Optional[dict] = None) -> List[Policy]:
     """Using a botocore Session object, return a list of Policy objects representing the bucket policies of each
     S3 bucket in this account.
     """
@@ -293,7 +311,8 @@ def get_s3_bucket_policies(session: botocore.session.Session, client_args_map: O
     for bucket in buckets:
         bucket_arn = 'arn:aws:s3:::{}'.format(bucket)  # TODO: allow different partition
         try:
-            bucket_policy = json.loads(s3client.get_bucket_policy(Bucket=bucket)['Policy'])
+            resp = cached(account_id, s3client.get_bucket_policy, Bucket=bucket)['Policy']
+            bucket_policy = json.loads(resp)
             result.append(Policy(
                 bucket_arn,
                 bucket,
@@ -320,7 +339,7 @@ def get_s3_bucket_policies(session: botocore.session.Session, client_args_map: O
     return result
 
 
-def get_kms_key_policies(session: botocore.session.Session, region_allow_list: Optional[List[str]] = None,
+def get_kms_key_policies(session: botocore.session.Session, account_id, region_allow_list: Optional[List[str]] = None,
                          region_deny_list: Optional[List[str]] = None, client_args_map: Optional[dict] = None) -> List[Policy]:
     """Using a botocore Session object, return a list of Policy objects representing the key policies of each
     KMS key in this account.
@@ -344,7 +363,7 @@ def get_kms_key_policies(session: botocore.session.Session, region_allow_list: O
 
             # Grab the key policies
             for cmk in cmks:
-                policy_str = kmsclient.get_key_policy(KeyId=cmk, PolicyName='default')['Policy']
+                policy_str = cached(account_id, kmsclient.get_key_policy, KeyId=cmk, PolicyName='default')['Policy']
                 result.append(Policy(
                     cmk,
                     cmk.split('/')[-1],  # CMK ARN Format: arn:<partition>:kms:<region>:<account>:key/<Key ID>
@@ -359,7 +378,7 @@ def get_kms_key_policies(session: botocore.session.Session, region_allow_list: O
     return result
 
 
-def get_sns_topic_policies(session: botocore.session.Session, region_allow_list: Optional[List[str]] = None,
+def get_sns_topic_policies(session: botocore.session.Session, account_id, region_allow_list: Optional[List[str]] = None,
                            region_deny_list: Optional[List[str]] = None, client_args_map: Optional[dict] = None) -> List[Policy]:
     """Using a botocore Session object, return a list of Policy objects representing the topic policies of each
     SNS topic in this account.
@@ -383,7 +402,7 @@ def get_sns_topic_policies(session: botocore.session.Session, region_allow_list:
 
             # Grab the topic policies
             for topic in topics:
-                policy_str = snsclient.get_topic_attributes(TopicArn=topic)['Attributes']['Policy']
+                policy_str = cached(account_id, snsclient.get_topic_attributes, TopicArn=topic)['Attributes']['Policy']
                 result.append(Policy(
                     topic,
                     topic.split(':')[-1],  # SNS Topic ARN Format: arn:<partition>:sns:<region>:<account>:<Topic Name>
@@ -417,16 +436,18 @@ def get_sqs_queue_policies(session: botocore.session.Session, account_id: str,
             # Grab the queue names
             queue_urls = []
             sqsclient = session.create_client('sqs', region_name=sqs_region, **sqsargs)
-            response = sqsclient.list_queues()
-            if 'QueueUrls' in response:
-                queue_urls.extend(response['QueueUrls'])
-            else:
-                continue
+            paginator = sqsclient.get_paginator('list_queues')
+            for page in paginator.paginate():
+                for response in page:
+                    if 'QueueUrls' in response:
+                        queue_urls.extend(response['QueueUrls'])
+                    else:
+                        continue
 
             # Grab the queue policies
             for queue_url in queue_urls:
                 queue_name = queue_url.split('/')[-1]
-                sqs_policy_response = sqsclient.get_queue_attributes(QueueUrl=queue_url, AttributeNames=['Policy'])
+                sqs_policy_response = cached(account_id, sqsclient.get_queue_attributes, QueueUrl=queue_url, AttributeNames=['Policy'])
                 if 'Policy' in sqs_policy_response:
                     sqs_policy_doc = json.loads(sqs_policy_response['Policy'])
                     result.append(Policy(
@@ -452,7 +473,7 @@ def get_sqs_queue_policies(session: botocore.session.Session, account_id: str,
     return result
 
 
-def get_secrets_manager_policies(session: botocore.session.Session, region_allow_list: Optional[List[str]] = None,
+def get_secrets_manager_policies(session: botocore.session.Session, account_id, region_allow_list: Optional[List[str]] = None,
                                  region_deny_list: Optional[List[str]] = None, client_args_map: Optional[dict] = None) -> List[Policy]:
     """Using a botocore Session object, return a list of Policy objects representing the resource policies
     of the secrets in AWS Secrets Manager.
@@ -480,7 +501,7 @@ def get_secrets_manager_policies(session: botocore.session.Session, region_allow
 
             # Grab resource policies for each secret
             for secret_arn in secret_arns:
-                sm_response = smclient.get_resource_policy(SecretId=secret_arn)
+                sm_response = cached(account_id, smclient.get_resource_policy, SecretId=secret_arn)
 
                 # verify that it is in the response and not None/empty
                 if 'ResourcePolicy' in sm_response and sm_response['ResourcePolicy']:
@@ -522,7 +543,7 @@ def get_unfilled_nodes(iamclient) -> List[Node]:
     # Get users, paginating results, still need to handle policies + group memberships + is_admin
     logger.info("Obtaining IAM users in account")
     user_paginator = iamclient.get_paginator('list_users')
-    for page in user_paginator.paginate(PaginationConfig={'PageSize': 25}):
+    for page in user_paginator.paginate(PaginationConfig={'PageSize': 500}):
         logger.debug('list_users page: {}'.format(page))
         for user in page['Users']:
             # grab permission boundary ARN if applicable
@@ -550,7 +571,7 @@ def get_unfilled_nodes(iamclient) -> List[Node]:
     # Get roles, paginating results, still need to handle policies + is_admin
     logger.info("Obtaining IAM roles in account")
     role_paginator = iamclient.get_paginator('list_roles')
-    for page in role_paginator.paginate(PaginationConfig={'PageSize': 25}):
+    for page in role_paginator.paginate(PaginationConfig={'PageSize': 500}):
         logger.debug('list_roles page: {}'.format(page))
         for role in page['Roles']:
             # grab permission boundary ARN if applicable
@@ -576,7 +597,7 @@ def get_unfilled_nodes(iamclient) -> List[Node]:
     # Get instance profiles, paginating results, and attach to roles as appropriate
     logger.info("Obtaining EC2 instance profiles in account")
     ip_paginator = iamclient.get_paginator('list_instance_profiles')
-    for page in ip_paginator.paginate(PaginationConfig={'PageSize': 25}):
+    for page in ip_paginator.paginate(PaginationConfig={'PageSize': 500}):
         logger.debug('list_instance_profiles page: {}'.format(page))
         for iprofile in page['InstanceProfiles']:
             iprofile_arn = iprofile['Arn']
@@ -616,7 +637,7 @@ def get_unfilled_groups(iamclient, nodes: List[Node]) -> List[Group]:
     # paginate through groups and build result
     logger.info("Obtaining IAM groups in the account.")
     group_paginator = iamclient.get_paginator('list_groups')
-    for page in group_paginator.paginate(PaginationConfig={'PageSize': 25}):
+    for page in group_paginator.paginate(PaginationConfig={'PageSize': 500}):
         logger.debug('list_groups page: {}'.format(page))
         for group in page['Groups']:
             result.append(Group(

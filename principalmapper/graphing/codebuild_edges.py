@@ -1,6 +1,5 @@
 """Code to identify if a principal in an AWS account can use access to AWS CodeBuild to access other principals."""
 
-
 #  Copyright (c) NCC Group and Erik Steringer 2019. This file is part of Principal Mapper.
 #
 #      Principal Mapper is free software: you can redistribute it and/or modify
@@ -19,6 +18,7 @@
 import logging
 from typing import Dict, List, Optional
 
+import botocore.session
 from botocore.exceptions import ClientError
 
 from principalmapper.common import Edge, Node
@@ -26,6 +26,7 @@ from principalmapper.graphing.edge_checker import EdgeChecker
 from principalmapper.querying import query_interface
 from principalmapper.querying.local_policy_simulation import resource_policy_authorization, ResourcePolicyEvalResult
 from principalmapper.util import arns, botocore_tools
+from principalmapper.util.storage import cached
 
 logger = logging.getLogger(__name__)
 
@@ -35,23 +36,24 @@ class CodeBuildEdgeChecker(EdgeChecker):
 
     def return_edges(self, nodes: List[Node], region_allow_list: Optional[List[str]] = None,
                      region_deny_list: Optional[List[str]] = None, scps: Optional[List[List[dict]]] = None,
-                     client_args_map: Optional[dict] = None) -> List[Edge]:
+                     client_args_map: Optional[dict] = None,
+                     session: 'Optional[botocore.session.Session]' = None) -> List[Edge]:
         """Fulfills expected method return_edges."""
 
         logger.info('Generating Edges based on CodeBuild.')
 
         # Gather projects information for each region
-
         if client_args_map is None:
             cbargs = {}
         else:
             cbargs = client_args_map.get('codebuild', {})
 
         codebuild_clients = []
-        if self.session is not None:
-            cf_regions = botocore_tools.get_regions_to_search(self.session, 'codebuild', region_allow_list, region_deny_list)
+        if session is not None:
+            cf_regions = botocore_tools.get_regions_to_search(session, 'codebuild', region_allow_list,
+                                                              region_deny_list)
             for region in cf_regions:
-                codebuild_clients.append(self.session.create_client('codebuild', region_name=region, **cbargs))
+                codebuild_clients.append(session.create_client('codebuild', region_name=region, **cbargs))
 
         codebuild_projects = []
         for cb_client in codebuild_clients:
@@ -60,12 +62,13 @@ class CodeBuildEdgeChecker(EdgeChecker):
             try:
                 # list the projects first, 50 at a time
                 paginator = cb_client.get_paginator('list_projects')
-                for page in paginator.paginate(PaginationConfig={'MaxItems': 50}):
+                for page in paginator.paginate(PaginationConfig={'MaxItems': 500}):
                     if 'projects' in page and len(page['projects']) > 0:
                         region_project_list_list.append(page['projects'])
 
                 for region_project_list in region_project_list_list:
-                    batch_project_data = cb_client.batch_get_projects(names=region_project_list)  # no pagination
+                    batch_project_data = cached(self.account_id, cb_client.batch_get_projects,
+                                                names=region_project_list)  # no pagination
                     if 'projects' in batch_project_data:
                         for project_data in batch_project_data['projects']:
                             if 'serviceRole' in project_data:
@@ -104,7 +107,8 @@ def _gen_resource_tag_conditions(tag_list: List[dict]):
     return condition_result
 
 
-def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] = None, codebuild_projects: Optional[List[dict]] = None) -> List[Edge]:
+def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] = None,
+                           codebuild_projects: Optional[List[dict]] = None) -> List[Edge]:
     """Generates and returns Edge objects related to AWS CodeBuild.
 
     It is possible to use this method if you are operating offline (infra-as-code). The `codebuild_projects` param
@@ -130,9 +134,11 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
         codebuild_map = {}  # type: Dict[str, List[dict]]
         for project in codebuild_projects:
             if project['project_role'] not in codebuild_map:
-                codebuild_map[project['project_role']] = [{'proj_arn': project['project_arn'], 'proj_tags': project['project_tags']}]
+                codebuild_map[project['project_role']] = [
+                    {'proj_arn': project['project_arn'], 'proj_tags': project['project_tags']}]
             else:
-                codebuild_map[project['project_role']].append({'proj_arn': project['project_arn'], 'proj_tags': project['project_tags']})
+                codebuild_map[project['project_role']].append(
+                    {'proj_arn': project['project_arn'], 'proj_tags': project['project_tags']})
 
     for node_destination in nodes:
         # check if destination is a user, skip if so

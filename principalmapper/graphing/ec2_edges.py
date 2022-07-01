@@ -1,6 +1,5 @@
 """Code to identify if a principal in an AWS account can use access to EC2 to access other principals."""
 
-
 #  Copyright (c) NCC Group and Erik Steringer 2019. This file is part of Principal Mapper.
 #
 #      Principal Mapper is free software: you can redistribute it and/or modify
@@ -27,7 +26,6 @@ from principalmapper.querying import query_interface
 from principalmapper.querying.local_policy_simulation import resource_policy_authorization, ResourcePolicyEvalResult
 from principalmapper.util import arns
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -36,7 +34,8 @@ class EC2EdgeChecker(EdgeChecker):
 
     def return_edges(self, nodes: List[Node], region_allow_list: Optional[List[str]] = None,
                      region_deny_list: Optional[List[str]] = None, scps: Optional[List[List[dict]]] = None,
-                     client_args_map: Optional[dict] = None) -> List[Edge]:
+                     client_args_map: Optional[dict] = None,
+                     session: Optional['botocore.session.Session'] = None) -> List[Edge]:
         """Fulfills expected method return_edges."""
 
         logger.info('Generating Edges based on EC2.')
@@ -103,7 +102,8 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
                     mfa_needed = True
 
                 create_ip_auth, mfa_res = query_interface.local_check_authorization_handling_mfa(
-                    node_source, 'iam:AddRoleToInstanceProfile', node_destination.arn, {}, service_control_policy_groups=scps)
+                    node_source, 'iam:AddRoleToInstanceProfile', node_destination.arn, {},
+                    service_control_policy_groups=scps)
                 if not create_ip_auth:
                     continue  # node_source can't attach a new instance profile to node_destination
                 if mfa_res:

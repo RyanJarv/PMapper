@@ -23,9 +23,9 @@ from typing import List, Optional
 from principalmapper.common import Edge, Node
 from principalmapper.graphing.edge_checker import EdgeChecker
 from principalmapper.querying import query_interface
-from principalmapper.querying.local_policy_simulation import resource_policy_authorization, ResourcePolicyEvalResult, has_matching_statement
+from principalmapper.querying.local_policy_simulation import resource_policy_authorization, ResourcePolicyEvalResult, \
+    has_matching_statement
 from principalmapper.util import arns
-
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,8 @@ class STSEdgeChecker(EdgeChecker):
 
     def return_edges(self, nodes: List[Node], region_allow_list: Optional[List[str]] = None,
                      region_deny_list: Optional[List[str]] = None, scps: Optional[List[List[dict]]] = None,
-                     client_args_map: Optional[dict] = None) -> List[Edge]:
+                     client_args_map: Optional[dict] = None,
+                     session: Optional['botocore.session.Session'] = None) -> List[Edge]:
         """Fulfills expected method return_edges. If the session object is None, performs checks in offline-mode"""
 
         result = generate_edges_locally(nodes, scps)
@@ -57,10 +58,6 @@ def generate_edges_locally(nodes: List[Node], scps: Optional[List[List[dict]]] =
             continue  # skip non-roles
 
         for node_source in nodes:
-            # skip self-access checks
-            if node_source == node_destination:
-                continue
-
             # check if source is an admin, if so it can access destination but this is not tracked via an Edge
             if node_source.is_admin:
                 continue
