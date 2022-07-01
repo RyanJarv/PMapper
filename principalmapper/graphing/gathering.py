@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import traceback
-from concurrent import futures
+from concurrent.futures import as_completed, ThreadPoolExecutor, ProcessPoolExecutor
 
 import botocore.session
 import botocore.exceptions
@@ -30,8 +30,9 @@ from principalmapper.graphing import edge_identification
 from principalmapper.querying import query_interface
 from principalmapper.util import arns
 from principalmapper.util.botocore_tools import get_regions_to_search
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
+from principalmapper.util.concurrency import check
 from principalmapper.util.storage import cached
 
 logger = logging.getLogger(__name__)
@@ -84,8 +85,13 @@ def create_graph(session: botocore.session.Session, service_list: list, region_a
     # Determine which nodes are admins and update node objects
     update_admin_status(nodes_result, scps)
 
+    ppool = ProcessPoolExecutor(max_workers=int(os.cpu_count() / 2))
+    tpool = ThreadPoolExecutor()
+
     # Generate edges, generate Edge objects
-    edges_result = edge_identification.obtain_edges(
+    edge_jobs = edge_identification.obtain_edges(
+        tpool,
+        ppool,
         session,
         service_list,
         nodes_result,
@@ -96,23 +102,23 @@ def create_graph(session: botocore.session.Session, service_list: list, region_a
     )
 
     # Pull S3, SNS, SQS, KMS, and Secrets Manager resource policies
-    try:
-        jobs = []
-        with futures.ThreadPoolExecutor() as pool:
-            jobs.append(pool.submit(get_s3_bucket_policies, session, caller_identity['Account'], client_args_map))
-            jobs.append(pool.submit(get_sns_topic_policies, session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map))
-            jobs.append(pool.submit(get_sqs_queue_policies, session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map))
-            jobs.append(pool.submit(get_kms_key_policies, session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map))
-            jobs.append(pool.submit(get_secrets_manager_policies, session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map))
+    policy_jobs = [
+        tpool.submit(get_s3_bucket_policies, session, caller_identity['Account'], client_args_map),
+        tpool.submit(get_sns_topic_policies, session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map),
+        tpool.submit(get_sqs_queue_policies, session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map),
+        tpool.submit(get_kms_key_policies, session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map),
+        tpool.submit(get_secrets_manager_policies, session, caller_identity['Account'], region_allow_list, region_deny_list, client_args_map),
+    ]
 
-        for job in futures.as_completed(jobs):
-            exc = job.exception()
-            if exc:
-                traceback.print_tb(exc.__traceback__)
-                continue
-            policies_result.extend(job.result())
-    except:
-        pass
+    edges_result = []
+    for job in check(as_completed(edge_jobs)):
+        edges_result.extend(job.result())
+
+    for job in check(as_completed(policy_jobs), throw=False):
+        policies_result.extend(job.result())
+
+    ppool.shutdown(wait=True)
+    tpool.shutdown(wait=True)
 
     return Graph(nodes_result, edges_result, policies_result, groups_result, metadata)
 
@@ -438,11 +444,13 @@ def get_sqs_queue_policies(session: botocore.session.Session, account_id: str,
             sqsclient = session.create_client('sqs', region_name=sqs_region, **sqsargs)
             paginator = sqsclient.get_paginator('list_queues')
             for page in paginator.paginate():
-                for response in page:
-                    if 'QueueUrls' in response:
-                        queue_urls.extend(response['QueueUrls'])
-                    else:
-                        continue
+                if 'QueueUrls' in page:
+                    try:
+                        queue_urls.extend(page['QueueUrls'])
+                    except Exception as e:
+                        pass
+                else:
+                    continue
 
             # Grab the queue policies
             for queue_url in queue_urls:

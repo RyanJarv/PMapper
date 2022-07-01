@@ -75,7 +75,7 @@ def get_cache(path: Path):
         return {}
 
 
-# Not thread safe and won't work across multiple accounts!
+# TODO: Not thread safe, not efficient, and error prone.
 def cached(account_or_org: str, f, *args, cache_key=None, **kwargs):
     root = Path(get_default_graph_path(account_or_org))/'cache'
     os.makedirs(root, exist_ok=True)

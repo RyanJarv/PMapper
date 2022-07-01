@@ -19,7 +19,8 @@ import logging
 import os
 import traceback
 from concurrent import futures
-from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from typing import List, Optional, Generator
 
 import botocore.session
 
@@ -34,9 +35,7 @@ from principalmapper.graphing.sagemaker_edges import SageMakerEdgeChecker
 from principalmapper.graphing.ssm_edges import SSMEdgeChecker
 from principalmapper.graphing.sts_edges import STSEdgeChecker
 
-
 logger = logging.getLogger(__name__)
-
 
 # Externally referable dictionary with all the supported edge-checking types
 checker_map = {
@@ -52,27 +51,16 @@ checker_map = {
 }
 
 
-def obtain_edges(session: 'botocore.session.Session', checker_list: List[str], nodes: List[Node], region_allow_list: Optional[List[str]] = None,
+def obtain_edges(tpool: 'ThreadPoolExecutor', ppool: 'ProcessPoolExecutor', session: 'botocore.session.Session',
+                 checker_list: List[str], nodes: List[Node], region_allow_list: Optional[List[str]] = None,
                  region_deny_list: Optional[List[str]] = None, scps: Optional[List[List[dict]]] = None,
-                 client_args_map: Optional[dict] = None) -> List[Edge]:
+                 client_args_map: Optional[dict] = None) -> Generator[futures.Future, None, None]:
     """Given a list of nodes and a botocore Session, return a list of edges between those nodes. Only checks
     against services passed in the checker_list param. """
-    results = []
     logger.info('Initiating edge checks.')
     logger.debug('Services being checked for edges: {}'.format(checker_list))
 
-    jobs = []
-    with futures.ProcessPoolExecutor(max_workers=int(os.cpu_count()/2)) as ppool:
-        with futures.ThreadPoolExecutor() as tpool:
-            checks = [checker_map[chk](ppool) for chk in checker_list if chk in checker_map]
+    checks = [checker_map[chk](ppool) for chk in checker_list if chk in checker_map]
 
-            for chk in checks:
-                jobs.append(tpool.submit(chk.return_edges, nodes, region_allow_list, region_deny_list, scps, client_args_map, session))
-
-        for job in futures.as_completed(jobs):
-            exc = job.exception()
-            if exc:
-                raise exc
-            results.extend(job.result())
-
-    return results
+    for chk in checks:
+        yield tpool.submit(chk.return_edges, nodes, region_allow_list, region_deny_list, scps, client_args_map, session)
