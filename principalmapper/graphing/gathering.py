@@ -85,7 +85,7 @@ def create_graph(session: botocore.session.Session, service_list: list, region_a
     # Determine which nodes are admins and update node objects
     update_admin_status(nodes_result, scps)
 
-    ppool = ProcessPoolExecutor(max_workers=int(os.cpu_count() / 2))
+    ppool = ProcessPoolExecutor(max_workers=int(os.cpu_count() - 2))
     tpool = ThreadPoolExecutor()
 
     # Generate edges, generate Edge objects
@@ -317,8 +317,8 @@ def get_s3_bucket_policies(session: botocore.session.Session, account_id, client
     for bucket in buckets:
         bucket_arn = 'arn:aws:s3:::{}'.format(bucket)  # TODO: allow different partition
         try:
-            resp = cached(account_id, s3client.get_bucket_policy, Bucket=bucket)['Policy']
-            bucket_policy = json.loads(resp)
+            resp = cached(account_id, s3client.get_bucket_policy, Bucket=bucket)
+            bucket_policy = json.loads(resp['Policy'])
             result.append(Policy(
                 bucket_arn,
                 bucket,

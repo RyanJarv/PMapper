@@ -21,7 +21,6 @@ import os.path
 import pickle
 import sys
 
-from functools import wraps
 from pathlib import Path
 
 import botocore.exceptions
@@ -88,7 +87,7 @@ def cached(account_or_org: str, f, *args, cache_key=None, **kwargs):
 
     cache_obj = cache.get(cache_key)
     # TODO: only throw non-temporary exceptions
-    if isinstance(cache_obj, Exception):
+    if isinstance(cache_obj, BaseException):
         raise cache_obj
     elif cache_obj is None:
         try:
@@ -96,6 +95,7 @@ def cached(account_or_org: str, f, *args, cache_key=None, **kwargs):
             cache[cache_key] = resp
         except Exception as e:
             cache[cache_key] = e
+            raise e
         finally:
             p.write_bytes(pickle.dumps(cache))
     return cache[cache_key]
